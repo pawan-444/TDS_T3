@@ -14,7 +14,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CSV_FILE = Path(__file__).parent / "students.csv"
+CSV_FILE = Path(__file__).parent / "q-fastapi.csv"
 
 
 def load_students():
