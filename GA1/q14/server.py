@@ -3,6 +3,7 @@ import contextvars
 import hashlib
 import os
 from contextlib import asynccontextmanager
+from mcp.server.transport_security import TransportSecuritySettings
 
 from mcp.server.fastmcp import Context, FastMCP
 from starlette.applications import Starlette
@@ -67,9 +68,24 @@ async def lifespan(app):
         yield
 
 
+security = TransportSecuritySettings(
+    allowed_hosts=[
+        "live-mcp-server-37iy.onrender.com",
+        "live-mcp-server-37iy.onrender.com:*",
+    ],
+    allowed_origins=[
+        "https://live-mcp-server-37iy.onrender.com",
+    ],
+)
+
 app = Starlette(
     routes=[
-        Mount("/", app=mcp.streamable_http_app()),
+        Mount(
+            "/",
+            app=mcp.streamable_http_app(
+                transport_security=security,
+            ),
+        ),
     ],
     lifespan=lifespan,
 )
