@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -16,9 +16,9 @@ log = logging.getLogger("ledger-agent")
 API_ROOT = os.getenv("LEDGER_API_ROOT", "").strip().rstrip("&?")
 IST = ZoneInfo("Asia/Kolkata")
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "Acme-Ledger-Agent/3.0"})
+SESSION.headers.update({"User-Agent": "Acme-Ledger-Agent/4.0"})
 
-app = FastAPI(title="Acme Appliances Ledger Agent", version="3.0.0")
+app = FastAPI(title="Acme Appliances Ledger Agent", version="4.0.0")
 ORDERS: list[dict[str, Any]] = []
 RATES: dict[str, float] = {"USD": 1.0, "EUR": 1.1, "INR": 0.01214}
 DATA_ERROR: str | None = None
@@ -28,14 +28,28 @@ class QuestionRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
 
 
-def api_url(path: str, page: int | None = None) -> str:
+def root_api_url() -> str:
     if not API_ROOT:
         raise RuntimeError("LEDGER_API_ROOT environment variable is not configured")
-    # LEDGER_API_ROOT must end at questionId=..., with NO path parameter.
-    params = {"path": path}
+    return API_ROOT
+
+
+def api_url(path: str, page: int | None = None) -> str:
+    base = root_api_url()
+    # Remove any accidental path/page query values from base, preserving auth params.
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(base)
+    query = parse_qs(parts.query, keep_blank_values=True)
+    query.pop("path", None)
+    query.pop("page", None)
+    query_items = []
+    for key, values in query.items():
+        for value in values:
+            query_items.append((key, value))
+    query_items.append(("path", path))
     if page is not None:
-        params["page"] = page
-    return API_ROOT + "&" + urlencode(params, safe="/")
+        query_items.append(("page", str(page)))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query_items, safe="/"), parts.fragment))
 
 
 def get_json(url: str) -> Any:
@@ -55,49 +69,103 @@ def rows_from(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def resolve_path(root: dict[str, Any], name: str) -> str:
+    links = root.get("links", {})
+    value = links.get(name) if isinstance(links, dict) else None
+    if not value:
+        raise ValueError(f"API root response has no links.{name}")
+    # Some links are relative paths such as /orders&page=1; the API's `path`
+    # parameter should receive that complete path string.
+    if isinstance(value, dict):
+        value = value.get("href") or value.get("url") or value.get("path")
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Unrecognized links.{name} format")
+    return value
+
+
+def api_url_for_link(link_path: str, page: int | None = None) -> str:
+    # `links.orders` can look like "/orders&page=1"; split its first path from
+    # any embedded query-like pagination and normalize to path=/orders&page=1.
+    clean = link_path.strip()
+    if clean.startswith("http://") or clean.startswith("https://"):
+        # Absolute links may be direct endpoint URLs, so use them as-is.
+        if page is None:
+            return clean
+        separator = "&" if "?" in clean else "?"
+        return clean + separator + f"page={page}"
+
+    # The discovery API encodes parameters inside the path string, e.g. /orders&page=1.
+    # Pass it as the `path` parameter; for explicit page N replace the initial page.
+    if page is not None:
+        clean = re.sub(r"([&?])page=\d+", rf"\g<1>page={page}", clean)
+        if not re.search(r"[&?]page=\d+", clean):
+            clean += ("&" if "?" in clean or "&" in clean else "&") + f"page={page}"
+    return api_url(clean)
+
+
 def load_all_orders() -> list[dict[str, Any]]:
-    # Deliberately use the documented/discovered paginated endpoint first.
-    first_url = api_url("/orders", 1)
-    first = get_json(first_url)
+    root = get_json(root_api_url())
+    if not isinstance(root, dict):
+        raise ValueError(f"API root returned {type(root).__name__}, expected object")
+    order_link = resolve_path(root, "orders")
+    first = get_json(api_url_for_link(order_link))
     rows = rows_from(first)
+
+    if isinstance(first, dict) and not rows and isinstance(first.get("links"), dict):
+        raise ValueError("Orders link returned another discovery response instead of order rows")
+
     if isinstance(first, list):
         if rows:
             return rows
-        raise ValueError(f"/orders page 1 returned an empty list (type={type(first).__name__})")
+        raise ValueError("Orders endpoint returned an empty list")
+
     if not isinstance(first, dict):
-        raise ValueError(f"Unexpected /orders page 1 response type: {type(first).__name__}")
+        raise ValueError(f"Unexpected orders response type: {type(first).__name__}")
 
     pages = int(first.get("pages", 1) or 1)
     next_url = first.get("next")
-    log.info("Orders page 1 loaded: %d rows; pages=%d; has_next=%s", len(rows), pages, bool(next_url))
+    log.info("Orders first page: %d rows; pages=%d; has_next=%s", len(rows), pages, bool(next_url))
 
     if next_url:
-        visited = set()
+        seen = set()
         while next_url:
-            if next_url in visited:
-                raise ValueError("Pagination loop detected in /orders next links")
-            visited.add(next_url)
+            if next_url in seen:
+                raise ValueError("Pagination loop detected in orders next links")
+            seen.add(next_url)
             response = SESSION.get(next_url, timeout=(5, 12))
             response.raise_for_status()
             page_data = response.json()
             if not isinstance(page_data, dict):
-                raise ValueError("Unexpected response while following /orders next link")
+                raise ValueError("Unexpected response while following orders next link")
             page_rows = rows_from(page_data)
             rows.extend(page_rows)
-            log.info("Loaded page %s: %d rows", page_data.get("page", "?"), len(page_rows))
+            log.info("Loaded orders page %s: %d rows", page_data.get("page", "?"), len(page_rows))
             next_url = page_data.get("next")
     else:
         for page in range(2, pages + 1):
-            page_data = get_json(api_url("/orders", page))
+            page_data = get_json(api_url_for_link(order_link, page))
             page_rows = rows_from(page_data)
             rows.extend(page_rows)
-            log.info("Loaded page %d: %d rows", page, len(page_rows))
+            log.info("Loaded orders page %d: %d rows", page, len(page_rows))
 
     if not rows:
-        # Include structure only, never log the secret-bearing URL.
         keys = list(first.keys()) if isinstance(first, dict) else []
-        raise ValueError(f"/orders returned zero rows; page 1 keys={keys}")
+        raise ValueError(f"Orders endpoint returned zero rows; response keys={keys}")
     return rows
+
+
+def load_rates() -> dict[str, float]:
+    try:
+        root = get_json(root_api_url())
+        link = resolve_path(root, "rates")
+        payload = get_json(api_url_for_link(link))
+        if isinstance(payload, dict) and isinstance(payload.get("usd_per_unit"), dict):
+            rates = {str(k).upper(): float(v) for k, v in payload["usd_per_unit"].items()}
+            rates.setdefault("USD", 1.0)
+            return rates
+    except Exception:
+        log.exception("Rates fetch failed; using fallback rates")
+    return {"USD": 1.0, "EUR": 1.1, "INR": 0.01214}
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -119,9 +187,8 @@ def refresh_data() -> None:
         if not raw:
             raise ValueError("API returned zero orders")
 
-        # Duplicate IDs: keep the latest updated_at record.
         latest: dict[str, dict[str, Any]] = {}
-        no_id: list[dict[str, Any]] = []
+        no_id = []
         for row in raw:
             oid = str(row.get("id", "")).strip()
             if not oid:
@@ -133,28 +200,17 @@ def refresh_data() -> None:
             if old is None or (new_dt is not None and (old_dt is None or new_dt >= old_dt)):
                 latest[oid] = row
         ORDERS = list(latest.values()) + no_id
-
-        try:
-            rates_payload = get_json(api_url("/rates"))
-            if isinstance(rates_payload, dict):
-                rate_map = rates_payload.get("usd_per_unit", {})
-                if isinstance(rate_map, dict) and rate_map:
-                    RATES = {str(k).upper(): float(v) for k, v in rate_map.items()}
-                    RATES.setdefault("USD", 1.0)
-        except Exception as exc:
-            log.warning("Rates endpoint failed; using fallback rates: %s", type(exc).__name__)
-            RATES = {"USD": 1.0, "EUR": 1.1, "INR": 0.01214}
-
+        RATES = load_rates()
         DATA_ERROR = None
-        log.info("Ledger loaded successfully: raw=%d, retained=%d", len(raw), len(ORDERS))
+        log.info("Ledger loaded: raw=%d unique=%d", len(raw), len(ORDERS))
     except Exception as exc:
         ORDERS = []
         DATA_ERROR = f"{type(exc).__name__}: {exc}"
-        log.exception("Ledger data load failed")
+        log.exception("Ledger load failed")
 
 
 @app.on_event("startup")
-def startup() -> None:
+def startup():
     refresh_data()
 
 
@@ -173,10 +229,6 @@ def usd(row: dict[str, Any]) -> float:
     if currency not in RATES:
         raise ValueError(f"Missing USD conversion rate for {currency}")
     return float(row.get("amount", 0) or 0) * RATES[currency]
-
-
-def order_date(row: dict[str, Any]) -> datetime | None:
-    return parse_dt(row.get("created_at"))
 
 
 def extract_period(q: str):
@@ -216,14 +268,13 @@ def answer_question(question: str):
     q = re.sub(r"\s+", " ", question.strip().lower())
     start, end = extract_period(q)
     rows = list(ORDERS)
-
     if start and end:
-        rows = [r for r in rows if (d := order_date(r)) is not None and start <= d < end]
+        rows = [r for r in rows if (d := parse_dt(r.get("created_at"))) is not None and start <= d < end]
 
-    region_names = ("north", "south", "east", "west", "central")
-    region = next((name.title() for name in region_names if re.search(rf"\b{name}\b", q)), None)
+    regions = ("north", "south", "east", "west", "central")
+    region = next((x.title() for x in regions if re.search(rf"\b{x}\b", q)), None)
     if region:
-        rows = [r for r in rows if str(r.get("region", "")).strip().lower() == region.lower()]
+        rows = [r for r in rows if str(r.get("region", "")).lower() == region.lower()]
 
     products = sorted({str(r.get("product", "")).strip() for r in ORDERS if r.get("product")}, key=len, reverse=True)
     product = next((p for p in products if p.lower() in q), None)
@@ -232,11 +283,11 @@ def answer_question(question: str):
 
     cm = re.search(r"\bC\d{4}\b", question, re.I)
     if cm:
-        cust = cm.group(0).upper()
-        rows = [r for r in rows if str(r.get("customer", "")).upper() == cust]
+        customer = cm.group(0).upper()
+        rows = [r for r in rows if str(r.get("customer", "")).upper() == customer]
 
-    asks_refund = bool(re.search(r"\b(refund|refunded|refunds|refunding)\b", q))
-    if asks_refund:
+    refunds = bool(re.search(r"\b(refund|refunded|refunds|refunding)\b", q))
+    if refunds:
         status = "refunded"
     elif re.search(r"\b(void|voided|cancelled|canceled)\b", q):
         status = "void"
@@ -254,37 +305,36 @@ def answer_question(question: str):
     average = bool(re.search(r"\b(average|avg|mean)\b", q))
     top = bool(re.search(r"\b(top|highest|most|best|largest|biggest|leading|maximum|max)\b", q))
     lowest = bool(re.search(r"\b(lowest|least|smallest|minimum|min)\b", q))
-    which = bool(re.search(r"\b(which|what|who)\b", q))
-    money = bool(re.search(r"\b(revenue|sales|turnover|spend|spent|generated|income|value|amount|total|worth|usd|dollars?|money)\b", q)) or asks_refund
+    money = bool(re.search(r"\b(revenue|sales|turnover|spend|spent|generated|income|value|amount|total|worth|usd|dollars?|money)\b", q)) or refunds
 
     if top or lowest:
         field = "customer" if customers or cm else "product"
         metric = "qty" if units else ("count" if count and orders else "money")
-        groups: dict[str, float] = {}
+        grouped: dict[str, float] = {}
         for row in rows:
             key = str(row.get(field, "")).strip()
             if not key:
                 continue
             st = str(row.get("status", "")).lower()
             if metric == "qty":
-                value = float(row.get("qty", 0) or 0) if st == "paid" else 0.0
+                val = float(row.get("qty", 0) or 0) if st == "paid" else 0.0
             elif metric == "count":
-                value = 1.0
+                val = 1.0
             else:
-                desired = "refunded" if asks_refund else "paid"
-                value = usd(row) if st == desired else 0.0
-            groups[key] = groups.get(key, 0.0) + value
-        if not groups:
+                wanted = "refunded" if refunds else "paid"
+                val = usd(row) if st == wanted else 0.0
+            grouped[key] = grouped.get(key, 0.0) + val
+        if not grouped:
             return 0
-        chosen = min(groups, key=groups.get) if lowest else max(groups, key=groups.get)
-        if which and not re.search(r"\b(how much|what amount|what value|how many dollars)\b", q):
+        chosen = min(grouped, key=grouped.get) if lowest else max(grouped, key=grouped.get)
+        if re.search(r"\b(which|what|who)\b", q) and not re.search(r"\b(how much|what amount|what value|how many dollars)\b", q):
             return chosen
-        value = groups[chosen]
-        return round(value, 2) if metric == "money" else int(value) if value.is_integer() else round(value, 2)
+        val = grouped[chosen]
+        return round(val, 2) if metric == "money" else int(val) if val.is_integer() else round(val, 2)
 
     if customers and count:
         return len({str(r.get("customer", "")).strip() for r in rows if r.get("customer")})
-    if count and (orders or asks_refund):
+    if count and (orders or refunds):
         return len(rows)
     if units:
         paid = [r for r in rows if str(r.get("status", "")).lower() == "paid"]
@@ -294,8 +344,8 @@ def answer_question(question: str):
         paid = [r for r in rows if str(r.get("status", "")).lower() == "paid"]
         return round(sum(usd(r) for r in paid) / len(paid), 2) if paid else 0
     if money:
-        desired = "refunded" if asks_refund else "paid"
-        return round(sum(usd(r) for r in rows if str(r.get("status", "")).lower() == desired), 2)
+        wanted = "refunded" if refunds else "paid"
+        return round(sum(usd(r) for r in rows if str(r.get("status", "")).lower() == wanted), 2)
     if customers:
         return len({str(r.get("customer", "")).strip() for r in rows if r.get("customer")})
     if count:
