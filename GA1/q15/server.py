@@ -276,10 +276,26 @@ def answer_question(question: str):
     if region:
         rows = [r for r in rows if str(r.get("region", "")).lower() == region.lower()]
 
-    products = sorted({str(r.get("product", "")).strip() for r in ORDERS if r.get("product")}, key=len, reverse=True)
-    product = next((p for p in products if p.lower() in q), None)
+    def normalize_text(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+    products = sorted(
+        {str(r.get("product", "")).strip() for r in ORDERS if r.get("product")},
+        key=len,
+        reverse=True,
+    )
+    normalized_question = normalize_text(q)
+    product = next(
+        (p for p in products if normalize_text(p) and
+         re.search(rf"\b{re.escape(normalize_text(p))}\b", normalized_question)),
+        None,
+    )
     if product:
-        rows = [r for r in rows if str(r.get("product", "")).strip().lower() == product.lower()]
+        normalized_product = normalize_text(product)
+        rows = [
+            r for r in rows
+            if normalize_text(r.get("product", "")) == normalized_product
+        ]
 
     cm = re.search(r"\bC\d{4}\b", question, re.I)
     if cm:
@@ -331,6 +347,16 @@ def answer_question(question: str):
             return chosen
         val = grouped[chosen]
         return round(val, 2) if metric == "money" else int(val) if val.is_integer() else round(val, 2)
+
+    # Distinct customers who placed at least one paid order for a specified product.
+    if customers and count and product and re.search(r"\bpaid\b", q):
+        paid_product_orders = [
+            r for r in rows
+            if normalize_text(r.get("product", "")) == normalize_text(product)
+            and str(r.get("status", "")).strip().lower() == "paid"
+            and str(r.get("customer", "")).strip()
+        ]
+        return len({str(r.get("customer", "")).strip() for r in paid_product_orders})
 
     if customers and count:
         return len({str(r.get("customer", "")).strip() for r in rows if r.get("customer")})
