@@ -78,14 +78,17 @@ security = TransportSecuritySettings(
     ],
 )
 
+mcp = FastMCP(
+    "Exam Challenge Server",
+    stateless_http=True,
+    json_response=True,
+    # streamable_http_path="/",
+    transport_security=security,
+)
+
 app = Starlette(
     routes=[
-        Mount(
-            "/",
-            app=mcp.streamable_http_app(
-                transport_security=security,
-            ),
-        ),
+        Mount("/", app=mcp.streamable_http_app()),
     ],
     lifespan=lifespan,
 )
