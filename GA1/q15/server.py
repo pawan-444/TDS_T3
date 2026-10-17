@@ -360,6 +360,13 @@ def answer_question(question: str):
 
     if customers and count:
         return len({str(r.get("customer", "")).strip() for r in rows if r.get("customer")})
+    # In ordinary language, "how many dollars ... on average" asks for an
+    # average monetary amount, not a count of matching orders. Resolve that
+    # metric before the generic "how many orders" rule below.
+    if average and money:
+        wanted = "refunded" if refunds else "paid"
+        amounts = [usd(r) for r in rows if str(r.get("status", "")).lower() == wanted]
+        return round(sum(amounts) / len(amounts), 2) if amounts else 0
     if count and (orders or refunds):
         return len(rows)
     if units:
